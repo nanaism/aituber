@@ -11,9 +11,7 @@ class MarioWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Mario RL Training")
         self.setGeometry(100, 100, 800, 600)
-        self.setWindowFlags(
-            self.windowFlags() | Qt.WindowStaysOnTopHint
-        )  # ウィンドウを最前面に
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
         # メインウィジェットとレイアウトの設定
         main_widget = QWidget()
@@ -22,24 +20,55 @@ class MarioWindow(QMainWindow):
 
         # ステータスラベルの設定
         self.status_label = QLabel("Episode: 0")
-        self.status_label.setStyleSheet("font-size: 20px; color: white;")
+        self.status_label.setStyleSheet(
+            """
+            font-size: 20px;
+            color: white;
+            padding: 10px;
+            background-color: rgba(0, 0, 0, 0.5);
+            border-radius: 5px;
+        """
+        )
         self.status_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self.status_label)
 
         # ゲーム画面の表示用ラベル
         self.game_label = QLabel()
         self.game_label.setAlignment(Qt.AlignCenter)
-        self.game_label.setMinimumSize(640, 480)  # 最小サイズを設定
+        self.game_label.setMinimumSize(640, 480)
+        self.game_label.setStyleSheet(
+            """
+            border: 2px solid #333;
+            background-color: black;
+        """
+        )
         layout.addWidget(self.game_label)
 
         # 学習中の表示用ラベル
         self.learning_label = QLabel("Learning...")
-        self.learning_label.setStyleSheet("font-size: 24px; color: white;")
+        self.learning_label.setStyleSheet(
+            """
+            font-size: 24px;
+            color: white;
+            padding: 20px;
+            background-color: rgba(0, 0, 0, 0.7);
+            border-radius: 10px;
+        """
+        )
         self.learning_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.learning_label)
 
         # ウィンドウの色設定
-        self.setStyleSheet("background-color: black;")
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background-color: #1a1a1a;
+            }
+            QWidget {
+                background-color: #1a1a1a;
+            }
+        """
+        )
 
         # 点滅するタイマーの設定
         self.dots = ""
@@ -55,15 +84,26 @@ class MarioWindow(QMainWindow):
     def show_frame(self, frame):
         """ゲームフレームの表示"""
         self.learning_label.hide()
+
+        if frame is None:
+            return
+
         height, width, channels = frame.shape
         bytes_per_line = channels * width
-        # フレームデータをnumpy配列として扱う
+
+        # フレームデータをバイト列に変換
         frame_data = frame.tobytes()
+
+        # QImageを作成
         qt_image = QImage(
             frame_data, width, height, bytes_per_line, QImage.Format_RGB888
         )
+
+        # QPixmapに変換してラベルに表示
         pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(self.game_label.size(), Qt.KeepAspectRatio)
+        scaled_pixmap = pixmap.scaled(
+            self.game_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
         self.game_label.setPixmap(scaled_pixmap)
         self.game_label.show()
 
@@ -78,7 +118,16 @@ class MarioWindow(QMainWindow):
 
 
 def create_gui():
+    """GUIを作成して返す"""
     app = QApplication(sys.argv)
     window = MarioWindow()
     window.show()
     return app, window
+
+
+# 単体テスト用
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MarioWindow()
+    window.show()
+    sys.exit(app.exec_())

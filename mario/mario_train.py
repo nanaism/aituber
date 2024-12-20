@@ -4,13 +4,15 @@ import os
 import random
 import sys
 import time
+
+# 警告を無視
+import warnings
 from collections import deque
 from pathlib import Path
 
-# Gym is an OpenAI toolkit for RL
 import gym
 import gym_super_mario_bros
-import matplotlib.pyplot as plt  # これを追加
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from gym.spaces import Box
@@ -21,20 +23,27 @@ from PIL import Image
 from torch import nn
 from torchvision import transforms as T
 
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 
 class SkipFrame(gym.Wrapper):
     def __init__(self, env, skip):
-        """Return only every `skip`-th frame"""
         super().__init__(env)
         self._skip = skip
 
     def step(self, action):
-        """Repeat action, and sum reward"""
         total_reward = 0.0
         done = False
         for i in range(self._skip):
-            # Accumulate reward and repeat the same action
             obs, reward, done, info = self.env.step(action)
+            # 報酬の調整
+            if info.get("flag_get", False):  # ゴール時
+                reward += 500
+            elif info.get("life", 2) < 2:  # ダメージを受けた時
+                reward -= 50
+            elif reward > 0:  # 前進している時
+                reward = reward * 2  # 前進の報酬を増やす
+
             total_reward += reward
             if done:
                 break
@@ -48,7 +57,6 @@ class GrayScaleObservation(gym.ObservationWrapper):
         self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
 
     def permute_orientation(self, observation):
-        # permute [H, W, C] array to [C, H, W] tensor
         observation = np.transpose(observation, (2, 0, 1))
         observation = torch.tensor(observation.copy(), dtype=torch.float)
         return observation
@@ -67,7 +75,6 @@ class ResizeObservation(gym.ObservationWrapper):
             self.shape = (shape, shape)
         else:
             self.shape = tuple(shape)
-
         obs_shape = self.shape + self.observation_space.shape[2:]
         self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
 
@@ -78,10 +85,6 @@ class ResizeObservation(gym.ObservationWrapper):
 
 
 class MarioNet(nn.Module):
-    """mini cnn structure
-    input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output
-    """
-
     def __init__(self, input_dim, output_dim):
         super().__init__()
         c, h, w = input_dim
@@ -105,8 +108,6 @@ class MarioNet(nn.Module):
         )
 
         self.target = copy.deepcopy(self.online)
-
-        # Q_target parameters are frozen.
         for p in self.target.parameters():
             p.requires_grad = False
 
@@ -122,33 +123,36 @@ class Mario:
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.save_dir = save_dir
-        self.memory = deque(maxlen=100000)
-        self.batch_size = 32
-        self.gamma = 0.9
-        self.burnin = 1e4  # min. experiences before training
-        self.learn_every = 3  # no. of experiences between updates to Q_online
-        self.sync_every = 1e4  # no. of experiences between Q_target & Q_online sync
-        self.save_every = 5e5  # no. of experiences between saving Mario Net
+
+        # 探索率の調整
+        self.exploration_rate = 1
+        self.exploration_rate_decay = 0.99999  # 少し大きく（遅く）する
+        self.exploration_rate_min = 0.1
+
+        # バッチサイズとメモリサイズの調整
+        self.memory = deque(maxlen=50000)  # メモリサイズを小さく
+        self.batch_size = 64  # バッチサイズを大きく
+
+        # 学習の頻度を調整
+        self.burnin = 1e3  # 小さくする（より早く学習開始）
+        self.learn_every = 1  # 毎ステップ学習
+        self.sync_every = 1e4
+        self.save_every = 5e5
+        self.gamma = 0.95  # 割引率を大きく
 
         self.use_cuda = torch.cuda.is_available()
         self.net = MarioNet(self.state_dim, self.action_dim).float()
         if self.use_cuda:
             self.net = self.net.to(device="cuda")
 
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.0001)
         self.loss_fn = torch.nn.SmoothL1Loss()
 
-        self.exploration_rate = 1
-        self.exploration_rate_decay = 0.99999975
-        self.exploration_rate_min = 0.1
         self.curr_step = 0
 
     def act(self, state):
-        """Given a state, choose an epsilon-greedy action"""
-        # EXPLORE
         if np.random.rand() < self.exploration_rate:
             action_idx = np.random.randint(self.action_dim)
-        # EXPLOIT
         else:
             state = state.__array__()
             if self.use_cuda:
@@ -159,16 +163,12 @@ class Mario:
             action_values = self.net(state, model="online")
             action_idx = torch.argmax(action_values, axis=1).item()
 
-        # decrease exploration_rate
         self.exploration_rate *= self.exploration_rate_decay
         self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
-
-        # increment step
         self.curr_step += 1
         return action_idx
 
     def cache(self, state, next_state, action, reward, done):
-        """Add the experience to memory"""
         state = state.__array__()
         next_state = next_state.__array__()
 
@@ -196,7 +196,6 @@ class Mario:
         )
 
     def recall(self):
-        """Sample experiences from memory"""
         batch = random.sample(self.memory, self.batch_size)
         state, next_state, action, reward, done = map(torch.stack, zip(*batch))
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
@@ -249,16 +248,12 @@ class Mario:
         if self.curr_step % self.learn_every != 0:
             return None, None
 
-        # Sample from memory
+        if len(self.memory) < self.batch_size:
+            return None, None
+
         state, next_state, action, reward, done = self.recall()
-
-        # Get TD Estimate
         td_est = self.td_estimate(state, action)
-
-        # Get TD Target
         td_tgt = self.td_target(reward, next_state, done)
-
-        # Backpropagate loss through Q_online
         loss = self.update_Q_online(td_est, td_tgt)
 
         return (td_est.mean().item(), loss)
@@ -278,22 +273,17 @@ class MetricLogger:
         self.ep_avg_losses_plot = save_dir / "loss_plot.jpg"
         self.ep_avg_qs_plot = save_dir / "q_plot.jpg"
 
-        # History metrics
         self.ep_rewards = []
         self.ep_lengths = []
         self.ep_avg_losses = []
         self.ep_avg_qs = []
 
-        # Moving averages, added for every call to record()
         self.moving_avg_ep_rewards = []
         self.moving_avg_ep_lengths = []
         self.moving_avg_ep_avg_losses = []
         self.moving_avg_ep_avg_qs = []
 
-        # Current episode metric
         self.init_episode()
-
-        # Timing
         self.record_time = time.time()
 
     def log_step(self, reward, loss, q):
@@ -305,7 +295,6 @@ class MetricLogger:
             self.curr_ep_loss_length += 1
 
     def log_episode(self):
-        "Mark end of episode"
         self.ep_rewards.append(self.curr_ep_reward)
         self.ep_lengths.append(self.curr_ep_length)
         if self.curr_ep_loss_length == 0:
@@ -367,14 +356,12 @@ class MetricLogger:
 
 
 def main():
-    # GUIの初期化
     app = QApplication(sys.argv)
     window = MarioWindow()
     window.show()
     window.raise_()
     app.processEvents()
 
-    # 環境の初期化
     env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0")
     env = JoypadSpace(env, [["right"], ["right", "A"]])
     env = SkipFrame(env, skip=4)
@@ -382,7 +369,6 @@ def main():
     env = ResizeObservation(env, shape=84)
     env = FrameStack(env, num_stack=4)
 
-    # Marioエージェントの初期化
     save_dir = Path("checkpoints") / datetime.datetime.now().strftime(
         "%Y-%m-%dT%H-%M-%S"
     )
@@ -390,25 +376,24 @@ def main():
     mario = Mario(
         state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir
     )
-
-    # ロガーの初期化
     logger = MetricLogger(save_dir)
 
     try:
-        episodes = 500
-        for e in range(episodes):
-            window.update_episode(e)
+        episode = 0
+        while True:  # 無限ループ
+            window.update_episode(episode)
             window.show_learning()
             app.processEvents()
 
             state = env.reset()
+            if isinstance(state, tuple):
+                state = state[0]
 
-            # エピソードのプレイ
             while True:
                 try:
                     frame = env.render("rgb_array")
                     if frame is not None:
-                        frame = np.array(frame)  # numpy配列に変換
+                        frame = np.array(frame)
                         window.show_frame(frame)
                     app.processEvents()
 
@@ -431,11 +416,17 @@ def main():
                     break
 
             logger.log_episode()
-            if e % 20 == 0:
+            if episode % 20 == 0:
                 logger.record(
-                    episode=e, epsilon=mario.exploration_rate, step=mario.curr_step
+                    episode=episode,
+                    epsilon=mario.exploration_rate,
+                    step=mario.curr_step,
                 )
 
+            episode += 1  # エピソード番号をインクリメント
+
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user")
     finally:
         window.close()
         env.close()
