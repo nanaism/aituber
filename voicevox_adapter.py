@@ -35,7 +35,7 @@ class VoicevoxAdapter:
         return res.content
 
     def get_voice(self, text: str):
-        speaker_id = 14
+        speaker_id = 8
         query_data: json = self.__create_audio_query(text, speaker_id=speaker_id)
         audio_bytes = self.__create_request_audio(query_data, speaker_id=speaker_id)
         audio_stream = io.BytesIO(audio_bytes)
